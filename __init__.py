@@ -1,10 +1,10 @@
 bl_info = {
     "name": "VSE to 3D Environment",
-    "author": "tintwotin",
-    "version": (1, 9),
+    "author": "tintwotin (Improved)",
+    "version": (1, 10),
     "blender": (3, 0, 0),
     "location": "Sequencer > Strip > Convert to 3D",
-    "description": "Converts strip to 3D Environment or Textured Dome with Shadows (Replaces existing)",
+    "description": "Converts strip to 3D Environment or Textured Dome with Shadows (Plays video automatically)",
     "category": "Sequencer",
 }
 
@@ -18,10 +18,11 @@ NAME_DOME_FLOOR = "VSE_Dome_Floor"
 NAME_ENV_CATCHER = "VSE_Shadow_Catcher"
 NAME_SUN = "VSE_Sun"
 
-def get_strip_path(context):
+def get_active_strip_and_path(context):
+    """Gets the active strip path and the strip object itself."""
     scene = context.scene
     if not scene.sequence_editor or not scene.sequence_editor.active_strip:
-        return None
+        return None, None
     
     strip = scene.sequence_editor.active_strip
     
@@ -30,9 +31,42 @@ def get_strip_path(context):
     elif strip.type == 'IMAGE':
         path = strip.directory + strip.elements[0].filename
     else:
-        return None
+        return None, None
         
-    return bpy.path.abspath(path)
+    return bpy.path.abspath(path), strip
+
+def apply_image_to_node(node, filepath, strip):
+    """Loads image or video and syncs it with the VSE strip timing to enable playback."""
+    try:
+        img = bpy.data.images.load(filepath)
+        is_video = False
+        
+        if strip.type == 'MOVIE':
+            img.source = 'MOVIE'
+            is_video = True
+        elif strip.type == 'IMAGE' and len(strip.elements) > 1:
+            img.source = 'SEQUENCE'
+            is_video = True
+            
+        node.image = img
+        
+        # Setup Video Playback Properties
+        if is_video and hasattr(node, 'image_user'):
+            node.image_user.use_auto_refresh = True # <--- This enables video playback
+            
+            # Match strip's timing if possible
+            if hasattr(strip, "frame_final_duration"):
+                node.image_user.frame_duration = strip.frame_final_duration
+            else:
+                node.image_user.frame_duration = 1048574
+                
+            if hasattr(strip, "frame_start"):
+                node.image_user.frame_start = strip.frame_start
+                
+            if hasattr(strip, "frame_offset_start"):
+                node.image_user.frame_offset = strip.frame_offset_start
+    except Exception as e:
+        print(f"Error loading image/video: {e}")
 
 def setup_cycles():
     bpy.context.scene.render.engine = 'CYCLES'
@@ -69,11 +103,10 @@ def redistribute_floor_geometry(obj):
             v.co.x *= scale_factor
             v.co.y *= scale_factor
 
-def create_polar_shader(obj, image_path):
+def create_polar_shader(obj, image_path, strip):
     """
     Creates a material that maps the HDRI floor using Object Coordinates (Polar conversion).
     """
-    # clear old material if exists
     obj.data.materials.clear()
     
     mat = bpy.data.materials.new(name="VSE_Dome_Mat_Floor")
@@ -101,12 +134,9 @@ def create_polar_shader(obj, image_path):
     # --- IMAGE ---
     node_tex = nodes.new('ShaderNodeTexImage')
     node_tex.location = (200, 0)
-    try:
-        node_tex.image = bpy.data.images.load(image_path)
-        node_tex.extension = 'CLIP'
-        node_tex.interpolation = 'Linear'
-    except:
-        pass
+    apply_image_to_node(node_tex, image_path, strip)
+    node_tex.extension = 'CLIP'
+    node_tex.interpolation = 'Linear'
 
     # --- POLAR MATH (Object Coords) ---
     node_coord = nodes.new('ShaderNodeTexCoord')
@@ -172,7 +202,7 @@ def create_polar_shader(obj, image_path):
     links.new(node_mix.outputs['Shader'], node_out.inputs['Surface'])
 
 
-def create_dome_shell_mat(obj, image_path):
+def create_dome_shell_mat(obj, image_path, strip):
     obj.data.materials.clear()
     mat = bpy.data.materials.new(name="VSE_Dome_Mat_Shell")
     mat.use_nodes = True
@@ -181,8 +211,7 @@ def create_dome_shell_mat(obj, image_path):
     nodes.clear()
     
     tex = nodes.new('ShaderNodeTexEnvironment')
-    try: tex.image = bpy.data.images.load(image_path)
-    except: pass
+    apply_image_to_node(tex, image_path, strip)
     
     coord = nodes.new('ShaderNodeTexCoord')
     emit = nodes.new('ShaderNodeEmission')
@@ -198,7 +227,7 @@ class VSE_OT_ConvertToEnvironment(bpy.types.Operator):
     bl_label = "Environment"
     bl_options = {'REGISTER', 'UNDO'}
     def execute(self, context):
-        filepath = get_strip_path(context)
+        filepath, strip = get_active_strip_and_path(context)
         if not filepath: return {'CANCELLED'}
         setup_cycles()
         
@@ -211,9 +240,10 @@ class VSE_OT_ConvertToEnvironment(bpy.types.Operator):
         world.use_nodes = True
         nodes = world.node_tree.nodes
         nodes.clear()
+        
         tex = nodes.new('ShaderNodeTexEnvironment')
-        try: tex.image = bpy.data.images.load(filepath)
-        except: pass
+        apply_image_to_node(tex, filepath, strip)
+        
         bg = nodes.new('ShaderNodeBackground')
         out = nodes.new('ShaderNodeOutputWorld')
         world.node_tree.links.new(tex.outputs['Color'], bg.inputs['Color'])
@@ -232,7 +262,7 @@ class VSE_OT_ConvertToHalfDome(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        filepath = get_strip_path(context)
+        filepath, strip = get_active_strip_and_path(context)
         if not filepath:
             self.report({'ERROR'}, "Please select a Movie or Image strip.")
             return {'CANCELLED'}
@@ -268,12 +298,8 @@ class VSE_OT_ConvertToHalfDome(bpy.types.Operator):
         bpy.ops.object.mode_set(mode='OBJECT')
         
         # Handle Objects after separation
-        # selected_objects usually contains [Original(Unselected), New(Selected)]
-        # We need to find which is which.
         objects = context.selected_objects
         
-        # The object that remains 'dome' is the one we started with. 
-        # The new object is the separated part.
         floor = None
         for obj in objects:
             if obj != dome:
@@ -292,10 +318,10 @@ class VSE_OT_ConvertToHalfDome(bpy.types.Operator):
             redistribute_floor_geometry(floor)
             
             # Apply Materials
-            create_polar_shader(floor, filepath)
+            create_polar_shader(floor, filepath, strip)
             floor.visible_shadow = False
         
-        create_dome_shell_mat(dome, filepath)
+        create_dome_shell_mat(dome, filepath, strip)
         dome.visible_shadow = False
         
         # Add Sun
