@@ -18,22 +18,56 @@ NAME_DOME_FLOOR = "VSE_Dome_Floor"
 NAME_ENV_CATCHER = "VSE_Shadow_Catcher"
 NAME_SUN = "VSE_Sun"
 
-def get_active_strip_and_path(context):
-    """Gets the active strip path and the strip object itself."""
+def _iter_strips(context):
+    """Yields the active strip first, then any selected strips (deduplicated)."""
     scene = context.scene
-    if not scene.sequence_editor or not scene.sequence_editor.active_strip:
-        return None, None
-    
-    strip = scene.sequence_editor.active_strip
-    
-    if strip.type == 'MOVIE':
-        path = strip.filepath
-    elif strip.type == 'IMAGE':
-        path = strip.directory + strip.elements[0].filename
-    else:
-        return None, None
-        
-    return bpy.path.abspath(path), strip
+    se = getattr(scene, "sequence_editor", None)
+    if se is None:
+        return
+
+    seen = set()
+    active = getattr(se, "active_strip", None)
+    if active is not None:
+        seen.add(active.as_pointer())
+        yield active
+
+    for strip in getattr(se, "strips", getattr(se, "sequences", [])):
+        if strip.select and strip.as_pointer() not in seen:
+            seen.add(strip.as_pointer())
+            yield strip
+
+
+def get_active_strip_and_path(context):
+    """Gets a usable strip path and the strip object itself.
+
+    Returns (filepath, strip) on success, or (None, reason_string) so the
+    caller can report exactly why nothing usable was found.
+    """
+    scene = context.scene
+    se = getattr(scene, "sequence_editor", None)
+    if se is None:
+        return None, "No sequence editor: add a strip in the Video Sequencer first."
+
+    strips = list(_iter_strips(context))
+    if not strips:
+        return None, "No active or selected strip. Click a strip to select it."
+
+    other_types = []
+    for strip in strips:
+        if strip.type == 'MOVIE':
+            path = strip.filepath
+        elif strip.type == 'IMAGE':
+            if not strip.elements:
+                continue
+            path = strip.directory + strip.elements[0].filename
+        else:
+            other_types.append(strip.type)
+            continue
+
+        return bpy.path.abspath(path), strip
+
+    found = ", ".join(sorted(set(other_types))) or "unknown"
+    return None, f"Selected strip is not a Movie or Image strip (found: {found})."
 
 def apply_image_to_node(node, filepath, strip):
     """Loads image or video and syncs it with the VSE strip timing to enable playback."""
@@ -228,7 +262,9 @@ class VSE_OT_ConvertToEnvironment(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
     def execute(self, context):
         filepath, strip = get_active_strip_and_path(context)
-        if not filepath: return {'CANCELLED'}
+        if not filepath:
+            self.report({'ERROR'}, strip or "Please select a Movie or Image strip.")
+            return {'CANCELLED'}
         setup_cycles()
         
         # Cleanup
@@ -264,7 +300,7 @@ class VSE_OT_ConvertToHalfDome(bpy.types.Operator):
     def execute(self, context):
         filepath, strip = get_active_strip_and_path(context)
         if not filepath:
-            self.report({'ERROR'}, "Please select a Movie or Image strip.")
+            self.report({'ERROR'}, strip or "Please select a Movie or Image strip.")
             return {'CANCELLED'}
 
         setup_cycles()
